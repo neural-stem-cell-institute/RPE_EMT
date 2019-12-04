@@ -1,0 +1,742 @@
+###########packages needed#########
+library(GenomicFeatures)
+library(rtracklayer)
+library(Rsamtools)
+library(GenomicRanges)
+library(goseq)
+library(edgeR)
+library(DESeq)
+library(DESeq2)
+library(ggplot2)
+library(GO.db)
+library(RColorBrewer)
+library(igraph)
+library(RCytoscape)
+library(org.Hs.eg.db)
+library(cgdsr)
+library(h20)
+library(foreach)
+library(multicore)
+library(doMC)
+registerDoMC(cores=20)
+############functions########
+############Enrichment analysis
+
+gotest<-function(dframe,genelengths,GO,group="UP"){
+	require(goseq)
+	if(group=="UP") {x<-which(dframe[,6]>0)} else {
+	x<-which(dframe[,6]<0)}
+	x<-dframe[x,]
+	x<-intersect(names(genelengths),rownames(x))
+	z<-setdiff(names(genelengths),x)
+	zs<-rep(0,length(z))
+	xs<-rep(1,length(x))
+	names(zs)<-z
+	names(xs)<-x
+	zt<-c(zs,xs)
+	zt<-zt[sort(names(genelengths))]
+	pwf<-nullp(zt,bias.data=genelengths)
+	fin<-goseq(pwf,gene2cat=GO)
+}
+
+gotest2<-function(group,dframe,genelengths,GO){
+	require(goseq)
+	test<-rownames(dframe[dframe$Grouping==group,])
+	z<-setdiff(names(genelengths),test)
+	zs<-rep(0,length(z))
+	xs<-rep(1,length(test))
+	names(zs)<-z
+	names(xs)<-test
+	zt<-c(zs,xs)
+	zt<-zt[sort(names(genelengths))]
+	pwf<-nullp(zt,bias.data=genelengths)
+	blue<-goseq(pwf,gene2cat=GO)
+}
+
+#########write a table from object produced by goseq function##########
+write.GO<-function(lis,genevec,name) {
+x<-GOnames[lis[,1]]
+y<-foreach(i=1:length(x),.combine='rbind') %dopar% {
+z<-length(intersect(GOids[[lis[i,1]]],genevec))
+b<-length(GOids[[lis[i,1]]])
+cbind(z,b,z/b*100)}
+blue<-cbind(x,lis,y)
+colnames(blue)<-c("GO name","GO ID","p-value","FDR","# Genes","Size of GO category","% of category")
+write.csv(blue,paste(name,".csv",sep=""))}
+
+#############Get genes closest to ChIP Peaks
+get.peaks.wsyms<-function(syms,peaks) {
+	fin<-foreach(i=1:length(syms),.combine='rbind') %doparf% {
+	peaks[grep(syms[i],peaks$closest.gene),]
+	}
+}
+
+
+############rna seq prep #################
+#########entrez to identifers############
+NAMES<-unlist(as.list(org.Hs.egGENENAME))
+SYMBOLS<-unlist(as.list(org.Hs.egSYMBOL))
+
+
+ucscGenomes()[ , "db"]
+supportedUCSCtables()
+human18<-makeTranscriptDbFromUCSC("hg18","knownGene")
+h18eg<-exonsBy(human18, "gene")
+
+x<-dir()
+counts<-foreach(i=1:length(x),.combine='cbind') %do% {
+	con<-readGappedAlignments(x[i],format="BAM")
+	con.rna<-summarizeOverlaps(h18eg,con,mode="IntersectionNotEmpty")
+	con.rna<-assay(con.rna)
+}
+colnames(counts)<-c("188 D0","190 D0","188 D1a","190 D1a","188 D1b","190 D1b","188 D1ab","190 D1ab","188 D5a","190 D5a","188 D5b","190 D5b","188 D5ab","190 D5ab")
+
+#############normalize genes#######################
+IDS<-rownames(counts)
+genelengths<-foreach(i=1:length(IDS),.combine='c') %dopar% {
+y<-h18eg[i]
+y<-y@unlistDataDay
+w<-y@width
+sum(w)
+}
+names(genelengths)<-IDS
+
+treat<-factor(c("D0","D0","D1a","D1a","D1b","D1b","D1ab","D1ab","D5a","D5a","D5b","D5b","D5ab","D5ab"))
+y<-DGEList(counts=counts,group=treat)
+y<-calcNormFactors(y)
+els<-y$samples$lib.size*y$samples$norm.factors
+thresholds<-(sum(genelengths)/50)/mean(els)*(genelengths/50)
+
+
+y<-data.frame(rownames=colnames(counts),condition=c("D0","D0","D1a","D1a","D1b","D1b","D1ab","D1ab","D5a","D5a","D5b","D5b","D5ab","D5ab"))
+x<-newCountDataSet(counts,y$condition)
+x<-estimateSizeFactors(x)
+norm.cts<-t(t(counts)/sizeFactors(x))
+
+##############move forward by analyzing d5ab ve D0################
+##########find genes with significant changes using edgeR package#############
+############apply a 2 fold change cutoff##############
+###########apply threshold to max value###########
+test<-cbind(counts[,1:2],counts[,13:14])
+treat<-factor(c("D0","D0","D5ab","D5ab"))
+ave.test<-cbind(apply(norm.cts[,1:2],1,mean),apply(norm.cts[,13:14],1,mean))
+max.test<-apply(ave.test,1,max)
+max.test<-which(max.test>thresholds[rownames(ave.test)])
+test<-test[max.test,]
+z<-apply(ave.test,1,max)
+b<-apply(ave.test,1,min)
+FC<-z/b
+
+y<-DGEList(counts=test,group=treat)
+y<-calcNormFactors(y)
+
+y<-estimateCommonDisp(y)
+y<-estimateTagwiseDisp(y)
+lrt<-exactTest(y)
+topTags(lrt)
+summary(dt<-decideTestsDGE(lrt))
+de.pval<-p.adjust(lrt$table[,3],"fdr")
+names(de.pval)<-rownames(lrt$table)
+x<-which(de.pval<=0.05)
+y<-as.matrix(lrt$table)
+z<-y[intersect(names(x),rownames(y)),]
+eR.DEgenes<-cbind(norm.cts[rownames(z),1:2],norm.cts[rownames(z),13:14])
+fdr<-de.pval[x]
+FoldDiff<-FC[names(x)]
+edgeR.genes<-cbind(eR.DEgenes,FoldDiff,z,fdr)
+x<-which(FoldDiff>=2)
+edgeR.genes<-edgeR.genes[names(x),]
+
+##############find genes with significant changes using DEseq2 package###############
+times<-c(0,0,5,5)
+times<-data.frame(times)
+x<-DESeqDataSetFromMatrix(test,colData=times,design=~times)
+colData(x)$times<-factor(colData(x)$times,levels=c(0,5))
+colnames(x)<-colnames(test)
+x<-estimateSizeFactors(x)
+x<-estimateDispersions(x)
+x<-nbinomWaldTest(x,pAdjustMethod="fdr")
+y<-as.matrix(results(x))
+y<-y[which(y[,5]<=0.05),]
+DEseq.genes<-cbind(norm.cts[rownames(y),1:2],norm.cts[rownames(y),13:14],y)
+colnames(DEseq.genes)<-c(colnames(norm.cts[,1:2]),colnames(norm.cts[,13:14]),colnames(y))
+
+################################
+x<-intersect(rownames(edgeR.genes),rownames(DEseq.genes))
+sig.genes.ab<-cbind(edgeR.genes[x,],DEseq.genes[x,9])
+colnames(sig.genes.ab)<-c(colnames(sig.genes.ab[,1:8]),"EdgeR FDR","DEseq FDR")
+sig.genes.ab<-sig.genes.ab
+
+##############move forward by analyzing d5a ve D0################
+##########find genes with significant changes using edgeR package#############
+############apply a 2 fold change cutoff##############
+###########apply threshold to max value###########
+test<-cbind(counts[,1:2],counts[,9:10])
+treat<-factor(c("D0","D0","D5a","D5a"))
+ave.test<-cbind(apply(norm.cts[,1:2],1,mean),apply(norm.cts[,9:10],1,mean))
+max.test<-apply(ave.test,1,max)
+max.test<-which(max.test>thresholds[rownames(ave.test)])
+test<-test[max.test,]
+z<-apply(ave.test,1,max)
+b<-apply(ave.test,1,min)
+FC<-z/b
+
+y<-DGEList(counts=test,group=treat)
+y<-calcNormFactors(y)
+
+y<-estimateCommonDisp(y)
+y<-estimateTagwiseDisp(y)
+lrt<-exactTest(y)
+topTags(lrt)
+summary(dt<-decideTestsDGE(lrt))
+de.pval<-p.adjust(lrt$table[,3],"fdr")
+names(de.pval)<-rownames(lrt$table)
+x<-which(de.pval<=0.05)
+y<-as.matrix(lrt$table)
+z<-y[intersect(names(x),rownames(y)),]
+eR.DEgenes<-cbind(norm.cts[rownames(z),1:2],norm.cts[rownames(z),9:10])
+fdr<-de.pval[x]
+FoldDiff<-FC[names(x)]
+edgeR.genes<-cbind(eR.DEgenes,FoldDiff,z,fdr)
+x<-which(FoldDiff>=2)
+edgeR.genes<-edgeR.genes[names(x),]
+
+##############find genes with significant changes using DEseq2 package###############
+times<-c(0,0,5,5)
+times<-data.frame(times)
+x<-DESeqDataSetFromMatrix(test,colData=times,design=~times)
+colData(x)$times<-factor(colData(x)$times,levels=c(0,5))
+colnames(x)<-colnames(test)
+x<-estimateSizeFactors(x)
+x<-estimateDispersions(x)
+x<-nbinomWaldTest(x,pAdjustMethod="fdr")
+y<-as.matrix(results(x))
+y<-y[which(x[,5]<=0.05),]
+DEseq.genes<-cbind(norm.cts[rownames(y),1:2],norm.cts[rownames(y),9:10],y)
+colnames(DEseq.genes)<-c(colnames(norm.cts[,1:2]),colnames(norm.cts[,9:10]),colnames(y))
+
+################################
+x<-intersect(rownames(edgeR.genes),rownames(DEseq.genes))
+
+sig.genes.a<-cbind(edgeR.genes[x,],DEseq.genes[x,9])
+colnames(sig.genes.a)<-c(colnames(sig.genes.a[,1:8]),"EdgeR FDR","DEseq FDR")
+
+
+##############move forward by analyzing d5b ve D0################
+##########find genes with significant changes using edgeR package#############
+############apply a 2 fold change cutoff##############
+###########apply threshold to max value###########
+test<-cbind(counts[,1:2],counts[,11:12])
+treat<-factor(c("D0","D0","D5b","D5b"))
+ave.test<-cbind(apply(norm.cts[,1:2],1,mean),apply(norm.cts[,11:12],1,mean))
+max.test<-apply(ave.test,1,max)
+max.test<-which(max.test>thresholds[rownames(ave.test)])
+test<-test[max.test,]
+z<-apply(ave.test,1,max)
+b<-apply(ave.test,1,min)
+FC<-z/b
+
+y<-DGEList(counts=test,group=treat)
+y<-calcNormFactors(y)
+
+y<-estimateCommonDisp(y)
+y<-estimateTagwiseDisp(y)
+lrt<-exactTest(y)
+topTags(lrt)
+summary(dt<-decideTestsDGE(lrt))
+de.pval<-p.adjust(lrt$table[,3],"fdr")
+names(de.pval)<-rownames(lrt$table)
+x<-which(de.pval<=0.05)
+y<-as.matrix(lrt$table)
+z<-y[intersect(names(x),rownames(y)),]
+eR.DEgenes<-cbind(norm.cts[rownames(z),1:2],norm.cts[rownames(z),11:12])
+fdr<-de.pval[x]
+FoldDiff<-FC[names(x)]
+edgeR.genes<-cbind(eR.DEgenes,FoldDiff,z,fdr)
+x<-which(FoldDiff>=2)
+edgeR.genes<-edgeR.genes[names(x),]
+
+##############find genes with significant changes using DEseq2 package###############
+times<-c(0,0,5,5)
+times<-data.frame(times)
+x<-DESeqDataSetFromMatrix(test,colData=times,design=~times)
+colData(x)$times<-factor(colData(x)$times,levels=c(0,5))
+colnames(x)<-colnames(test)
+x<-estimateSizeFactors(x)
+x<-estimateDispersions(x)
+x<-nbinomWaldTest(Sue,pAdjustMethod="fdr")
+y<-as.matrix(results(x))
+y<-y[which(y[,5]<=0.05),]
+DEseq.genes<-cbind(norm.cts[rownames(y),1:2],norm.cts[rownames(y),11:12],y)
+colnames(DEseq.genes)<-c(colnames(norm.cts[,1:2]),colnames(norm.cts[,11:12]),colnames(y))
+
+################################
+x<-intersect(rownames(edgeR.genes),rownames(DEseq.genes))
+
+sig.genes.b<-cbind(edgeR.genes[x,],DEseq.genes[x,9])
+colnames(sig.genes.b)<-c(colnames(sig.genes.b[,1:8]),"EdgeR FDR","DEseq FDR")
+
+
+################GO analysis#########
+library(goseq)
+y<-rownames(counts)
+GO<-getgo(y,"hg18","knownGene","GO:BP")
+genlen<-genelengths[sort(y)]
+
+UP.GO.tnt<-gotest(sig.genes.ab,genlen,GO)
+
+down.GO.tnt<-gotest(sig.genes.ab,genlen,GO,"DOWN")
+
+##########KEGG enrichment#######
+
+GO<-getgo(y,"hg18","knownGene","KEGG")
+
+KEGG.tnt.up<-gotest(sig.genes.ab,genlen,GO)
+
+KEGG.tnt.down<-gotest(sig.genes.ab,genlen,GO,"DOWN")
+
+#########load NAM RPE data from PMID:28132833#########
+#########intersect with EMT data and make into data frame with following groupings###
+########## grouping key 1=down in EMT, down in NAM
+###########		2= down nam, up EMT
+###########		3=up in nam, down in EMT
+###########		4=up in EMT, up in Nam
+
+nam<-data.deseq.drugvehicle
+nam<-nam[nam$padj<=0.1,]
+
+nam<-nam[which(abs(nam$log2FoldChange)>=1),]
+x<-intersect(rownames(sig.genes.ab),rownames(nam))
+EMT.nam<-data.frame(nam[x,1:2],sig.genes.ab[x,5:6],nam[x,17:18])
+
+x<-ifelse(EMT.nam$logFC>0,1,0)
+y<-ifelse(EMT.nam$log2FoldChange<0,1,3)
+Grouping<-x+y
+EMT.nam<-data.frame(EMT.nam,Grouping)
+
+write.csv(EMT.nam,"EMT.nam.table.csv")
+
+
+nam2<-gotest2(2,EMT.nam,genelengths,GO)
+
+FDR<-p.adjust(nam2[,2],"fdr")
+nam2<-data.frame(nam2,FDR)
+nam2.s<-nam2[nam2$FDR<=0.1,]
+write.csv(nam2.s,"dNam_uEMT_GOBP.csv")
+
+pdf("emt.nam.treemap.pdf", paper="USr")
+
+treemap(stuff,index = c("representative","description"),
+    vSize = "abslog10pvalue", type = "categorical", vColor = "representative",
+      title = "uEMT_med_treemap",inflate.labels = FALSE,    
+      lowerbound.cex.labels = 0, bg.labels = "#CCCCCC00",     
+      position.legend = "none")
+
+dev.off()
+
+
+##########get Peaks Files from Wysoka Lab###
+###################
+peaks<-data.frame(read.csv("Tomek.peaks.csv",colClasses = "character"))
+)
+
+#######identify nearest genes to distal peaks and promoter peaks 
+
+
+
+x<-peaks[-(peaks$promoter==1),]
+z1<-unique(x$closest.gene)
+
+y<-peaks[(peaks$promoter==1),]
+y1<-unique(y$closest.gene)
+
+###so z1= genes with potential enhancer peaks and y1 is genes with peaks in promoter
+
+########look at intersection of TNT significant genes with enhancer peaks
+TNT<-SYMBOLS[rownames(sig.genes.ab)]
+TNT.u<-SYMBOLS[rownames(sig.genes.ab[sig.genes.ab[,6]>0,])]
+TNT.d<-SYMBOLS[rownames(sig.genes.ab[sig.genes.ab[,6]<0,])]
+
+
+TNTu.z1<-intersect(z1,TNT.u)
+
+get.peaks.wsyms<-function(syms,peaks) {
+	fin<-foreach(i=1:length(syms),.combine='rbind') %dopar% {
+		peaks[grep(syms[i],peaks$closest.gene),]
+		}
+	fin<-data.frame(fin[,1:3],fin[5:6],rep(0,dim(fin)[1]))
+	colnames(fin)<-c(colnames(fin[,1:5]),"strand")
+	return(fin)
+}
+
+
+
+
+
+
+TNTu.z1<-get.peaks.wsyms(TNTu.z1,peaks)
+
+TNTd.z1<-c(intersect(z1,TNT.d))
+TNTd.z1<-get.peaks.wsyms(TNTd.z1,peaks)
+
+write.table(TNTd.z1,"Tomek.down.txt",sep="\t",row.names=FALSE,quote=FALSE)
+
+write.table(TNTu.z1,"Tomek.up.txt",sep="\t",row.names=FALSE,quote=FALSE)
+
+##########Take the tables from the intersection and run Homer motiff analysis in terminal
+findMotifsGenome.pl "Tomek.up.txt" hg19 RNA.tnt.up.motiff/ -size 750 -mask -p 12
+findMotifsGenome.pl "Tomek.down.txt" hg19 RNA.tnt.down.motiff/ -size 750 -mask -p 12
+
+########after making an txt with significant motifs, go back to R###
+#######clean up files generated by Homer to get potential interacting transcription factors
+x<-data.frame(read.delim("known.up.csv"))
+red<-as.character(x$Motif.Name)
+red<-strsplit(red,"\\(")
+up.k.factors<-foreach(i=1:length(red),.combine='c') %dopar% {red[[i]][1]}
+
+up.k.factors<-toupper(up.k.factors)
+up.k.factors<-foreach(i=1:length(up.k.factors),.combine='c') %dopar% {
+	names(which(SYMBOLS==up.k.factors[i]))
+}
+
+x<-data.frame(read.csv("Homer.up.csv"))
+red<-as.character(x$Best.Match.Details)
+
+red<-strsplit(red,"\\(")
+up.h.factors<-foreach(i=1:length(red),.combine='c') %dopar% {red[[i]][1]}
+
+up.h.factors[4]<-"MYBL1"
+up.h.factors[5]<-"SMAD3"
+up.h.factors[7]<-"MAFK1"
+up.h.factors[9]<-"SPDEF"
+up.h.factors[10]<-"NKX3-1"
+up.h.factors[12]<-"JUND"
+up.h.factors[15]<-"HOXD13"
+up.h.factors[19]<-"SOX6"
+up.h.factors[22]<-"GRHL2"
+up.h.factors[25]<-"ARID5A"
+up.h.factors[26]<-"HLTF"
+up.h.factors[27]<-"ZFP105"
+up.h.factors<-toupper(up.h.factors)
+
+up.h.factors<-foreach(i=1:length(up.h.factors),.combine='c') %dopar% {
+	names(which(SYMBOLS==up.h.factors[i]))
+}
+
+test.u<-unique(c(up.h.factors,up.k.factors))
+
+
+x<-data.frame(read.delim("known.down.csv"))
+red<-as.character(x$Motif.Name)
+red<-strsplit(red,"\\(")
+down.k.factors<-foreach(i=1:length(red),.combine='c') %dopar% {red[[i]][1]}
+down.k.factors<-toupper(down.k.factors)
+down.k.factors<-foreach(i=1:length(down.k.factors),.combine='c') %dopar% {
+	names(which(SYMBOLS==down.k.factors[i]))
+}
+
+
+
+
+x<-data.frame(read.csv("Homer.down.csv"))
+red<-as.character(x$Best.Match.Details)
+red<-strsplit(red,"\\(")
+down.h.factors<-foreach(i=1:length(red),.combine='c') %dopar% {red[[i]][1]}
+down.h.factors
+down.h.factors[2]<-"TEAD2"
+down.h.factors[3]<-"EVX1"
+down.h.factors[5]<-"CEBPB"
+down.h.factors[6]<-"PKNOX2"
+down.h.factors[7]<-"SOX10"
+down.h.factors[9]<-"TCFAP2E"
+down.h.factors[15]<-"PITX3"
+down.h.factors[17]<-"ZBTB12"
+down.h.factors[18]<-"TEAD2"
+down.h.factors[19]<-"HOXB7"
+down.h.factors[20]<-"RBPJ"
+down.h.factors[21]<-"GATA3"
+down.h.factors[22]<-"MSX2"
+down.h.factors[23]<-"TCFP2"
+down.h.factors[24]<-"SIX1"
+down.h.factors[25]<-"SP4"
+down.h.factors[27]<-"MYB"
+down.h.factors[28]<-"TRP"
+down.h.factors[29]<-"USF2"
+down.h.factors[30]<-"Gm397"
+down.h.factors[31]<-"Plagl1"
+down.h.factors<-toupper(down.h.factors)
+down.h.factors<-foreach(i=1:length(down.h.factors),.combine='c') %dopar% {
+	names(which(SYMBOLS==down.h.factors[i]))
+}
+
+test.d<-unique(c(down.h.factors,down.k.factors))
+
+##########so test.d is a vector of potential regulatory transcription factors from the "Tomek.down.txt" file
+#########and test.u is a vector of potential regulatory transcription factors from the "Tomek.up.txt" file
+
+x<-intersect(test.u,rownames(sig.genes.ab[which(sig.genes.ab[,6]>0),]))
+y<-intersect(test.d,rownames(sig.genes.ab[which(sig.genes.ab[,6]<0),]))
+
+
+
+
+
+####create a data.frame with  genes ID, significantly increasing expression (1 or 0), 
+#### and is a potenital regulatory TF (1 or 0)
+###up first
+z<-rownames(sig.genes.ab[which(sig.genes.ab[,6]>0),])
+z<-setdiff(z,x)
+
+z<-data.frame(z,rep(1,length(z)))
+z<-data.frame(z,rep(0,dim(z)[1]))
+colnames(z)<-c("Gene","Expression","TF")
+x<-data.frame(x,rep(1,length(x)))
+x<-data.frame(x,rep(1,dim(z)[1]))
+x<-data.frame(x,rep(1,dim(x)[1]))
+colnames(x)<-c("Gene","Expression","TF")
+uppsy<-rbind(z,x)
+
+
+x<-intersect(test.u,rownames(sig.genes.ab[which(sig.genes.ab[,6]>0),]))
+x<-setdiff(test.u,x)
+x<-counts[x,]
+x<-x[,13:14]
+z<-intersect(which(x[,1]>10),which(x[,2]>10))
+
+x<-data.frame(x,rep(0,length(x)))
+x<-data.frame(x,rep(1,dim(x)[1]))
+uppsy<-rbind(uppsy,x)
+colnames(x)<-c("Gene","Expression","TF")
+dim(uppsy)
+write.csv(uppsy,"Networks.motifs.csv")
+
+##########make a data.frame for all transcription factors expressed at day 5
+
+
+m<-intersect(test.u,rownames(norm.cts))
+x<-data.frame(apply(norm.cts[m,1:2],1,mean),apply(norm.cts[m,13:14],1,mean))
+colnames(x)<-c("d0","d5")
+
+test.u1<-test.u[-(which(x[,2]==0))]
+
+m<-intersect(test.d,rownames(norm.cts))
+x<-data.frame(apply(norm.cts[m,1:2],1,mean),apply(norm.cts[m,13:14],1,mean))
+colnames(x)<-c("d0","d5")
+
+test.d1<-test.d[-(which(x[,1]==0))]
+
+
+
+x<-intersect(test.u1,rownames(sig.genes.ab[which(sig.genes.ab[,6]>0),]))
+g1<-setdiff(names(z),test.u1)
+g1<-data.frame(g1,rep(1,length(g1)))
+g1<-data.frame(g1,rep(0,dim(g1)[1]))
+g1<-data.frame(g1,rep(1,dim(g1)[1]))
+colnames(g1)<-c("Gene","Expression","TF","Enhancer")
+
+g2<-intersect(x,names(z))
+g2<-data.frame(g2,rep(2,length(g2)))
+g2<-data.frame(g2,rep(2,dim(g2)[1]))
+g2<-data.frame(g2,rep(1,dim(g2)[1]))
+colnames(g2)<-c("Gene","Expression","TF","Enhancer")
+mups<-rbind(g1,g2)
+
+g3<-setdiff(test.u1,names(z))
+g3<-setdiff(g3,rownames(sig.genes.ab))
+g3<-data.frame(g3,rep(0,length(g3)))
+g3<-data.frame(g3,rep(1,dim(g3)[1]))
+g3<-data.frame(g3,rep(0,dim(g3)[1]))
+colnames(g3)<-c("Gene","Expression","TF","Enhancer")
+mups<-rbind(mups,g3)
+
+
+g4<-intersect(test.u1,rownames(sig.genes.ab))
+g4<-setdiff(g4,names(z))
+g4<-setdiff(g4,x)
+g4<-data.frame(g4,rep(-1,length(g4)))
+g4<-data.frame(g4,rep(1,dim(g4)[1]))
+g4<-data.frame(g4,rep(0,dim(g4)[1]))
+colnames(g4)<-c("Gene","Expression","TF","Enhancer")
+mups<-rbind(mups,g4)
+
+
+#########get enhancer peaks increased at day 5
+z<-peaks[which(as.numeric(peaks$log2FoldChange.K27ac)>0),]
+z<-z[z$promoter==0,]
+z<-intersect(blue.u,z$closest.gene)
+z<-foreach(i=1:length(z),.combine='c') %dopar% {
+	blue.u[which(z[i]==blue.u)]
+}
+
+####test to see which tfs had increased peaks 
+g5<-intersect(test.u1,rownames(sig.genes.ab))
+g5<-setdiff(g5,x)
+g5<-intersect(g5,names(z))
+########no tfs went down and had enhancer peaks up
+
+g6<-setdiff(test.u1,rownames(sig.genes.ab))
+g6<-intersect(g6,names(z))
+#####steady TFs had no enhancer peaks up
+
+g7<-setdiff(test.u1,rownames(sig.genes.ab))
+g7<-setdiff(g7,names(z))
+g7<-data.frame(g7,rep(0,length(g7)))
+g7<-data.frame(g7,rep(1,dim(g7)[1]))
+g7<-data.frame(g7,rep(0,dim(g7)[1]))
+colnames(g7)<-c("Gene","Expression","TF","Enhancer")
+mups<-rbind(mups,g7)
+
+mups[,5]<-SYMBOLS[as.character(mups[,1])]
+colnames(mups)<-c(colnames(mups[,1:4]),"Symbols")
+
+######all TFs that are expressed but not changing have no associated enhancer peaks###
+
+
+write.csv(mups,"TNT.up.motiff.csv")
+
+########down
+z<-peaks[which(as.numeric(peaks$log2FoldChange.K27ac)<0),]
+z<-z[z$promoter==0,]
+z<-intersect(blue.d,z$closest.gene)
+z<-foreach(i=1:length(z),.combine='c') %dopar% {
+	blue.d[which(z[i]==blue.d)]
+}
+
+
+
+x<-intersect(test.d1,rownames(sig.genes.ab[which(sig.genes.ab[,6]<0),]))
+d1<-setdiff(names(z),test.d1)
+d1<-data.frame(d1,rep(1,length(d1)))
+d1<-data.frame(d1,rep(0,dim(d1)[1]))
+d1<-data.frame(d1,rep(1,dim(d1)[1]))
+colnames(d1)<-c("Gene","Expression","TF","Enhancer")
+
+d2<-intersect(x,names(z))
+d2<-data.frame(d2,rep(2,length(d2)))
+d2<-data.frame(d2,rep(2,dim(d2)[1]))
+d2<-data.frame(d2,rep(1,dim(d2)[1]))
+colnames(d2)<-c("Gene","Expression","TF","Enhancer")
+mdow<-rbind(poo,d2)
+
+d3<-setdiff(test.d1,names(z))
+d3<-setdiff(d3,rownames(sig.genes.ab))
+d3<-data.frame(d3,rep(0,length(d3)))
+d3<-data.frame(d3,rep(1,dim(d3)[1]))
+d3<-data.frame(d3,rep(0,dim(d3)[1]))
+colnames(d3)<-c("Gene","Expression","TF","Enhancer")
+mdow<-rbind(mdow,d3)
+
+
+d4<-intersect(test.d1,rownames(sig.genes.ab))
+d4<-setdiff(d4,names(z))
+d4<-setdiff(d4,x)
+d4<-data.frame(d4,rep(-1,length(d4)))
+d4<-data.frame(d4,rep(1,dim(d4)[1]))
+d4<-data.frame(d4,rep(0,dim(d4)[1]))
+colnames(d4)<-c("Gene","Expression","TF","Enhancer")
+mdow<-rbind(mdow,d4)
+
+########no tfs went down and had enhancer peaks up
+
+#####steady TFs had no enhancer peaks up
+
+d5<-setdiff(test.d1,rownames(sig.genes.ab))
+d5<-setdiff(d5,names(z))
+d5<-data.frame(d5,rep(0,length(d5)))
+d5<-data.frame(d5,rep(1,dim(d5)[1]))
+d5<-data.frame(d5,rep(0,dim(d5)[1]))
+colnames(d5)<-c("Gene","Expression","TF","Enhancer")
+mdow<-rbind(mdow,d5)
+
+mdow[,5]<-SYMBOLS[as.character(mdow[,1])]
+colnames(mdow)<-c(colnames(mdow[,1:4]),"Symbols")
+write.csv(mdow,"TNT.down.motiff.csv")
+
+####clean up motiff files
+###############up
+x<-data.frame(read.delim("known.up.csv"))
+red<-as.character(x$Motif.Name)
+red<-strsplit(red,"\\(")
+red<-foreach(i=1:length(red),.combine='c') %dopar% {red[[i]][1]}
+red<-toupper(red)
+names(red)<-rownames(x)
+b<-mups[mups$TF>0,]
+z<-foreach(i=1:dim(b)[1],.combine='c') %dopar% {
+	names(red[which(red==as.character(b$Symbols)[i])])}
+
+
+test<-foreach(i=1:length(z),.combine='c') %dopar% {
+	paste("known",z[i],".motif",sep="")}
+test<-unique(test)
+test<-paste(test,collapse=" ")
+test<-paste("cat",test,"> test.up.motif")
+fileConn<-file("output.txt")
+writeLines(test,fileConn)
+close(fileConn)
+
+##down
+x<-data.frame(read.delim("known.down.csv"))
+red<-as.character(x$Motif.Name)
+red<-strsplit(red,"\\(")
+red<-foreach(i=1:length(red),.combine='c') %dopar% {red[[i]][1]}
+red<-toupper(red)
+names(red)<-rownames(x)
+b<-mdow[mdow$TF>0,]
+z<-foreach(i=1:dim(b)[1],.combine='c') %dopar% {
+	names(red[which(red==as.character(b$Symbols)[i])])}
+
+
+test<-foreach(i=1:length(z),.combine='c') %dopar% {
+	paste("known",z[i],".motif",sep="")}
+test<-unique(test)
+test<-paste(test,collapse=" ")
+test<-paste("cat",test,"> test.down.motif")
+fileConn<-file("output.txt")
+writeLines(test,fileConn)
+close(fileConn)
+#########go to terminal enter string from output.txt and run Homer to find genes associated with each motif
+annotatePeaks.pl "Tomek.up.txt" hg19  -m test.up.motif > output.up.motif
+annotatePeaks.pl "Tomek.down.txt" hg19  -m test.down.motif > output.down.motif
+
+############up adj.matrix
+test<-data.frame(read.delim("output.up.motif"))
+x<-colnames(test)
+b<-strsplit(x[22:178],"\\.")
+b<-foreach(i=1:length(b),.combine='c') %dopar% {b[[i]][1]}
+
+colnames(test)<-c(x[1:21],b)
+b<-unique(test[,12])
+btf<-colnames(test[22:178])
+btf<-toupper(btf)
+btf[82]<-"FOXA1"
+adj.mat.up<-foreach(i=1:length(b),.combine='rbind') %dopar% {
+	x<-test[which(test$Entrez.ID==b[i]),]
+	mid<-foreach(m=22:dim(x)[2],.combine='c') %do%{
+		if(length(which(x[,m]!="")>0)>0) {btf[m-21]} else {}
+	}
+	mid<-unique(mid)
+	mid<-cbind(mid,rep(SYMBOLS[as.character(b[i])],length(mid)))
+}	
+colnames(adj.mat.up)<-c("Node1","Node2")
+write.csv(adj.mat.up,"edgelist.up.csv")
+##########down adj.mat
+test<-data.frame(read.delim("output.down.motif"))
+x<-colnames(test)
+b<-strsplit(x[22:length(x)],"\\.")
+b<-foreach(i=1:length(b),.combine='c') %dopar% {b[[i]][1]}
+
+colnames(test)<-c(x[1:21],b)
+btf<-toupper(b)
+b<-unique(test[,12])
+
+adj.mat.down<-foreach(i=1:length(b),.combine='rbind') %dopar% {
+	x<-test[which(test$Entrez.ID==b[i]),]
+	mid<-foreach(m=22:dim(x)[2],.combine='c') %do%{
+		if(length(which(x[,m]!="")>0)>0) {btf[m-21]} else {}
+	}
+	mid<-unique(mid)
+	mid<-cbind(mid,rep(SYMBOLS[as.character(b[i])],length(mid)))
+}	
+colnames(adj.mat.down)<-c("Node1","Node2")
+write.csv(adj.mat.down,"edgelist.down.csv")
+

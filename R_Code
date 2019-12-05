@@ -740,3 +740,34 @@ adj.mat.down<-foreach(i=1:length(b),.combine='rbind') %dopar% {
 colnames(adj.mat.down)<-c("Node1","Node2")
 write.csv(adj.mat.down,"edgelist.down.csv")
 
+############generating treemaps from Revigo output
+library(treemap) 							
+
+stuff <- data.frame(read.csv("revigo.table.csv"))
+
+stuff$abslog10pvalue <- abs(as.numeric( as.character(stuff$log10pvalue) ))
+stuff$freqInDbPercent <- as.numeric( as.character(stuff$frequencyInDb) )
+stuff$uniqueness <- as.numeric( as.character(stuff$uniqueness) )
+stuff$dispensability <- as.numeric( as.character(stuff$dispensability) )
+
+
+pdf( file="revigo_treemap.pdf", width=16, height=9 ) # width and height are in inches
+
+
+treemap(
+	stuff,
+	index = c("representative","description"),
+	vSize = "abslog10pvalue",
+	type = "categorical",
+	vColor = "representative",
+	title = "REVIGO Gene Ontology treemap",
+	inflate.labels = FALSE,      # set this to TRUE for space-filling group labels - good for posters
+	lowerbound.cex.labels = 0,   # try to draw as many labels as possible (still, some small squares may not get a label)
+	bg.labels = "#CCCCCCAA",     # define background color of group labels
+												       # "#CCCCCC00" is fully transparent, "#CCCCCCAA" is semi-transparent grey, NA is opaque
+	position.legend = "none"
+)
+
+dev.off()
+
+
